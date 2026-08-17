@@ -1,0 +1,30 @@
+# Web UI
+gradio>=6.0
+fastapi
+uvicorn
+
+# LLM
+openai>=1.0
+
+# 搜索 & 数据源
+duckduckgo-search>=6.0
+wikipedia-api
+yt-dlp>=2024.0                    # 视频字幕（YouTube/Bilibili等）
+
+# 爬虫
+beautifulsoup4
+lxml
+httpx
+tenacity                          # 重试机制
+
+# 向量检索 & RAG
+faiss-cpu
+sentence-transformers
+scikit-learn
+
+# 数据模型 & 存储
+pydantic>=2.0
+aiosqlite
+
+# 工具
+python-dotenv

@@ -1,0 +1,17 @@
+# 统一换行符：文本文件入库用 LF，避免 Windows/Unix 混用 CRLF 造成 diff 噪音
+* text=auto
+
+# 明确标记二进制文件（勿做换行转换）
+*.db binary
+*.pkl binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.zip binary
+*.gz binary
+*.ttf binary
+*.woff binary
+*.woff2 binary

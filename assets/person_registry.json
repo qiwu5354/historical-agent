@@ -1,0 +1,82 @@
+{
+  "弗洛伊德": {
+    "aliases": ["弗洛伊德", "西格蒙德·弗洛伊德", "Sigmund Freud", "Freud"],
+    "standard_name": "弗洛伊德",
+    "nation": "奥地利",
+    "era": "1856-1939",
+    "works_dir": "弗洛伊德"
+  },
+  "尼采": {
+    "aliases": ["尼采", "弗里德里希·尼采", "Friedrich Nietzsche", "Nietzsche"],
+    "standard_name": "尼采",
+    "nation": "德国",
+    "era": "1844-1900"
+  },
+  "康德": {
+    "aliases": ["康德", "伊曼努尔·康德", "Immanuel Kant", "Kant"],
+    "standard_name": "康德",
+    "nation": "德国",
+    "era": "1724-1804"
+  },
+  "亚里士多德": {
+    "aliases": ["亚里士多德", "亚里斯多德", "Aristotle"],
+    "standard_name": "亚里士多德",
+    "nation": "古希腊",
+    "era": "公元前384-公元前322"
+  },
+  "苏格拉底": {
+    "aliases": ["苏格拉底", "Socrates"],
+    "standard_name": "苏格拉底",
+    "nation": "古希腊",
+    "era": "公元前470-公元前399"
+  },
+  "亚当·斯密": {
+    "aliases": ["亚当·斯密", "亚当史密斯", "Adam Smith", "Smith"],
+    "standard_name": "亚当·斯密",
+    "nation": "英国",
+    "era": "1723-1790",
+    "works_dir": "亚当·斯密"
+  },
+  "凯恩斯": {
+    "aliases": ["凯恩斯", "约翰·梅纳德·凯恩斯", "John Maynard Keynes", "Keynes"],
+    "standard_name": "凯恩斯",
+    "nation": "英国",
+    "era": "1883-1946"
+  },
+  "托克维尔": {
+    "aliases": ["托克维尔", "亚历克西·德·托克维尔", "Alexis de Tocqueville", "Tocqueville"],
+    "standard_name": "托克维尔",
+    "nation": "法国",
+    "era": "1805-1859"
+  },
+  "司马迁": {
+    "aliases": ["司马迁", "太史公", "Sima Qian"],
+    "standard_name": "司马迁",
+    "nation": "中国",
+    "era": "公元前145-约公元前86"
+  },
+  "孔子": {
+    "aliases": ["孔子", "孔丘", "仲尼", "Confucius"],
+    "standard_name": "孔子",
+    "nation": "中国",
+    "era": "公元前551-公元前479"
+  },
+  "爱因斯坦": {
+    "aliases": ["爱因斯坦", "阿尔伯特·爱因斯坦", "Albert Einstein", "Einstein"],
+    "standard_name": "爱因斯坦",
+    "nation": "德国/美国",
+    "era": "1879-1955"
+  },
+  "达尔文": {
+    "aliases": ["达尔文", "查尔斯·达尔文", "Charles Darwin", "Darwin"],
+    "standard_name": "达尔文",
+    "nation": "英国",
+    "era": "1809-1882"
+  },
+  "莎士比亚": {
+    "aliases": ["莎士比亚", "威廉·莎士比亚", "William Shakespeare", "Shakespeare"],
+    "standard_name": "莎士比亚",
+    "nation": "英国",
+    "era": "1564-1616"
+  }
+}
