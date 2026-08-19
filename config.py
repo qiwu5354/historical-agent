@@ -16,10 +16,8 @@ except ImportError:
 
 
 # ===== 代理设置（仅在显式配置时生效；未配置则直连，不强行指定本地代理）=====
-_PROXY = os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY")
-if _PROXY:
-    os.environ.setdefault("HTTPS_PROXY", _PROXY)
-    os.environ.setdefault("HTTP_PROXY", _PROXY)
+# 读到后即可直接使用，无需 setdefault（旧代码因 _PROXY 已存在，setdefault 是 no-op）。
+_PROXY = os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY") or ""
 
 
 def _env_float(key: str, default: float) -> float:

@@ -73,7 +73,7 @@ def save_documents(docs: list[Document]) -> int:
         return 0
     rows = [
         (d.doc_id, d.character_name, d.source_type, d.source_detail,
-         d.title, d.era, d.language, d.content)
+         d.title, d.era, d.language, d.category, d.content)
         for d in docs
     ]
     with get_conn() as conn:
@@ -82,8 +82,8 @@ def save_documents(docs: list[Document]) -> int:
         cur = conn.executemany(
             """
             INSERT OR IGNORE INTO documents
-            (doc_id, character_name, source_type, source_detail, title, era, language, content)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            (doc_id, character_name, source_type, source_detail, title, era, language, category, content)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             rows,
         )
@@ -101,7 +101,7 @@ def save_character_with_documents(character: Character, docs: list[Document]) ->
     """
     rows = [
         (d.doc_id, d.character_name, d.source_type, d.source_detail,
-         d.title, d.era, d.language, d.content)
+         d.title, d.era, d.language, d.category, d.content)
         for d in docs
     ]
     with get_conn() as conn:
@@ -122,8 +122,8 @@ def save_character_with_documents(character: Character, docs: list[Document]) ->
             conn.executemany(
                 """
                 INSERT OR IGNORE INTO documents
-                (doc_id, character_name, source_type, source_detail, title, era, language, content)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                (doc_id, character_name, source_type, source_detail, title, era, language, category, content)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 rows,
             )

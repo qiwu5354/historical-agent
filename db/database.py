@@ -34,6 +34,7 @@ CREATE TABLE IF NOT EXISTS documents (
     title           TEXT,
     era             TEXT,
     language        TEXT,
+    category        TEXT,
     content         TEXT NOT NULL,
     created_at      TEXT DEFAULT (datetime('now', 'localtime')),
     FOREIGN KEY (character_name) REFERENCES characters(name)
@@ -54,13 +55,35 @@ CREATE INDEX IF NOT EXISTS idx_conversations_character ON conversations(characte
 """
 
 
+_MIGRATIONS = [
+    # 旧库补 category 列（documents 表）
+    """
+    ALTER TABLE documents ADD COLUMN category TEXT
+    """,
+    # 迁移完成后补建 category 索引（列不存在时无法建索引）
+    """
+    CREATE INDEX IF NOT EXISTS idx_documents_category ON documents(category)
+    """,
+]
+
+
+def _run_migrations(conn: sqlite3.Connection) -> None:
+    """幂等迁移：为已存在的旧库补齐新列。重复执行不会报错。"""
+    for sql in _MIGRATIONS:
+        try:
+            conn.execute(sql)
+        except sqlite3.OperationalError:
+            pass  # 列已存在（重复执行）
+
+
 def init_db(db_path: Path | None = None) -> None:
-    """初始化数据库（创建表）。幂等，可重复调用。"""
+    """初始化数据库（创建表 + 迁移）。幂等，可重复调用。"""
     ensure_dirs()
     path = db_path or DB_PATH
     with sqlite3.connect(path) as conn:
         conn.execute("PRAGMA foreign_keys = ON")
         conn.executescript(SCHEMA_SQL)
+        _run_migrations(conn)
         conn.commit()
     logger.info("数据库初始化完成: %s", path)
 

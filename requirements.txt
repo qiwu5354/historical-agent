@@ -22,9 +22,7 @@ faiss-cpu
 sentence-transformers
 scikit-learn
 
-# 数据模型 & 存储
-pydantic>=2.0
-aiosqlite
+# 数据模型 & 存储（用 stdlib dataclasses + sqlite3，无额外 ORM 依赖）
 
 # 工具
 python-dotenv

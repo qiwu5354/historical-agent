@@ -15,6 +15,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import pickle
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -42,31 +43,37 @@ _active_backend: str | None = None    # 运行时确定，None=未探测
 
 # 全局共享的 embedding 模型（加载耗时，单例）
 _embedding_model: Any = None
+_singleton_lock = threading.Lock()
 
 
 # ==================== 后端探测 ====================
 
 def _try_load_transformer():
-    """尝试加载 sentence-transformers 模型，成功则返回模型，失败返回 None。"""
+    """尝试加载 sentence-transformers 模型，成功则返回模型，失败返回 None。
+    使用双重检查锁避免 Gradio 多线程下重复加载耗时模型。"""
     global _embedding_model
     if _embedding_model is not None:
         return _embedding_model
-    try:
-        from sentence_transformers import SentenceTransformer
-        logger.info("加载向量模型: %s ...", settings.rag.embedding_model)
-        _embedding_model = SentenceTransformer(
-            settings.rag.embedding_model, device="cpu"
-        )
-        # 做一次空编码验证可用
-        _embedding_model.encode(["测试"], normalize_embeddings=True)
-        logger.info("向量模型加载完成（transformer 后端）")
-        return _embedding_model
-    except Exception as e:
-        logger.warning(
-            "sentence-transformers 不可用（%s），将回退到 TF-IDF 后端。"
-            "如需更高质量的语义检索，请修复 torch 安装。", e
-        )
-        return None
+    with _singleton_lock:
+        if _embedding_model is not None:
+            return _embedding_model
+        try:
+            from sentence_transformers import SentenceTransformer
+            logger.info("加载向量模型: %s ...", settings.rag.embedding_model)
+            model = SentenceTransformer(
+                settings.rag.embedding_model, device="cpu"
+            )
+            # 做一次空编码验证可用
+            model.encode(["测试"], normalize_embeddings=True)
+            logger.info("向量模型加载完成（transformer 后端）")
+            _embedding_model = model
+            return _embedding_model
+        except Exception as e:
+            logger.warning(
+                "sentence-transformers 不可用（%s），将回退到 TF-IDF 后端。"
+                "如需更高质量的语义检索，请修复 torch 安装。", e
+            )
+            return None
 
 
 def detect_backend() -> str:
@@ -293,8 +300,9 @@ def build_context(
 
     blocks: list[str] = []
     for doc, score in results:
+        category_tag = doc.category_label()
         blocks.append(
-            f"【{doc.source_label()}｜{doc.source_detail}】(相关度 {score:.2f})\n{doc.content}"
+            f"【{category_tag}｜{doc.source_detail}】(相关度 {score:.2f})\n{doc.content}"
         )
     return "\n\n---\n\n".join(blocks)
 

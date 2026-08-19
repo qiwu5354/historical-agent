@@ -25,6 +25,23 @@ SOURCE_LABELS = {
     SOURCE_VIDEO: "视频字幕",
 }
 
+# 资料类别（面向用户的资料分类，独立于技术来源类型）
+CATEGORY_WORK = "work"                   # 本人著作/自传/文章
+CATEGORY_BIOGRAPHY = "biography"         # 他人撰写的传记/评传/研究
+CATEGORY_HISTORY = "history"             # 权威史料/同时代历史背景
+CATEGORY_WIKI = "wiki"                   # 百科资料
+CATEGORY_VIDEO = "video"                 # 视频字幕
+CATEGORY_WEB = "web"                     # 其他网页资料
+
+CATEGORY_LABELS = {
+    CATEGORY_WORK: "本人著作/自传",
+    CATEGORY_BIOGRAPHY: "他人传记/评传",
+    CATEGORY_HISTORY: "权威史料/时代背景",
+    CATEGORY_WIKI: "百科资料",
+    CATEGORY_VIDEO: "视频字幕",
+    CATEGORY_WEB: "其他网页资料",
+}
+
 
 @dataclass
 class Document:
@@ -37,6 +54,7 @@ class Document:
     era: str = ""                         # 写作/发布年代
     language: str = "zh"                  # 原文语种
     content: str = ""                     # 段落文本
+    category: str = ""                    # 资料类别，见 CATEGORY_* 常量（空=未标注）
     # 向量不在此存储（FAISS 独立管理），doc_id 作为关联键
 
     def to_dict(self) -> dict[str, Any]:
@@ -50,3 +68,7 @@ class Document:
     def source_label(self) -> str:
         """来源中文标签，用于 UI 展示"""
         return SOURCE_LABELS.get(self.source_type, self.source_type)
+
+    def category_label(self) -> str:
+        """资料类别中文标签；未标注时回退到来源标签"""
+        return CATEGORY_LABELS.get(self.category) or self.source_label()

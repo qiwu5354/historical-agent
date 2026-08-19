@@ -58,39 +58,18 @@ def _resolve_registry_name(name: str) -> str:
 
 # ==================== 构建人物档案 ====================
 
-def build_character_action(
-    name: str, enable_video: bool = False
-):
+def _build_with_identity(name: str, identity, enable_video: bool = False):
     """
-    构建人物档案的生成器（流式输出进度）。
-    yield (状态文本, 档案Markdown, 进度值, 聊天框更新, 人物档案 State)
+    用已确认的 identity 流式构建人物档案（yield 7 元组）：
+    (状态文本, 档案Markdown, 进度值, 聊天框更新, 人物档案 State, 候选Radio更新, 确认按钮更新)
     """
-    name = name.strip()
-    if not name:
-        yield "⚠️ 请输入历史人物/学者名字", "", 0, gr.update(), gr.update()
-        return
-
-    # 先查库，避免重复构建。要求档案和文档段落都在库中，
-    # 否则（例如旧版本只存了档案没存文档）重新构建以补齐。
-    lookup_name = _resolve_registry_name(name)
-    existing = repo.find_character_by_any_name(lookup_name)
-    if existing and repo.get_documents(existing.name):
-        history = repo.get_history(existing.name)
-        yield (
-            f"✅ 已从档案库加载「{existing.name}」（{existing.doc_count}段资料）",
-            existing.summary(),
-            100,
-            history,
-            existing,
-        )
-        return
-
-    # 实时构建
     try:
         from core.character_builder import build_character_streaming
         from core.rag_engine import build_index
 
-        gen = build_character_streaming(name, enable_video=enable_video)
+        gen = build_character_streaming(
+            name, identity=identity, enable_video=enable_video
+        )
         collected_text = ""
         char: Character | None = None
         docs: list = []
@@ -102,10 +81,16 @@ def build_character_action(
                 char, docs = stop.value or (None, [])
                 break
             collected_text += chunk
-            yield collected_text, "", progress_value, gr.update(), gr.update()
+            yield (
+                collected_text, "", progress_value,
+                gr.update(), gr.update(), gr.update(), gr.update(),
+            )
 
         if char is None:
-            yield collected_text + "\n\n❌ 档案构建失败", "", 0, gr.update(), gr.update()
+            yield (
+                collected_text + "\n\n❌ 档案构建失败", "", 0,
+                gr.update(), gr.update(), gr.update(), gr.update(),
+            )
             return
 
         # 持久化档案 + 文档段落（替换旧文档），再基于文档构建检索索引
@@ -117,15 +102,160 @@ def build_character_action(
                 logger.warning("索引构建失败（对话仍可用，仅缺 RAG）: %s", e)
 
         final = f"✅ 档案构建完成！\n\n{char.summary()}"
-        yield final, char.summary(), 100, [], char
+        yield final, char.summary(), 100, [], char, gr.update(), gr.update()
     except Exception as e:
         logger.exception("构建档案失败")
-        yield f"❌ 构建失败：{e}", "", 0, gr.update(), gr.update()
+        yield (
+            f"❌ 构建失败：{e}", "", 0,
+            gr.update(), gr.update(), gr.update(), gr.update(),
+        )
+
+
+def build_character_action(
+    name: str, enable_video: bool = False
+):
+    """
+    构建人物档案的生成器（流式输出进度）。
+
+    流程：
+      1. 先查库（已有档案直接加载）；
+      2. 否则联网 + LLM 识别用户输入的名字；
+      3. 若名字指向多个不同人物（同名消歧），列出候选，等待用户确认后继续；
+      4. 确认后按“本人著作/自传 → 他人传记/评传 → 权威史料/时代背景”检索，
+         把资料交给 LLM 提炼档案。
+
+    yield 7 元组：
+    (状态文本, 档案Markdown, 进度值, 聊天框更新, 人物档案 State, 候选Radio更新, 确认按钮更新)
+    """
+    import json as _json
+
+    name = name.strip()
+    if not name:
+        yield "⚠️ 请输入历史人物/学者名字", "", 0, gr.update(), gr.update(), gr.update(), gr.update()
+        return
+
+    # 先查库，避免重复构建。要求档案和文档段落都在库中，
+    # 否则（例如旧版本只存了档案没存文档）重新构建以补齐。
+    lookup_name = _resolve_registry_name(name)
+    existing = repo.find_character_by_any_name(lookup_name)
+    if existing and repo.get_documents(existing.name):
+        docs = repo.get_documents(existing.name)
+        history = repo.get_history(existing.name)
+        from core.data_collector import format_collected_materials
+        yield (
+            f"✅ 已从档案库加载「{existing.name}」（{existing.doc_count}段资料）\n\n"
+            f"{format_collected_materials(docs)}",
+            existing.summary(),
+            100,
+            history,
+            existing,
+            gr.update(),
+            gr.update(),
+        )
+        return
+
+    # 联网 + LLM 识别：先确定用户指的是哪个具体人物
+    try:
+        from core.person_identifier import identify_person
+        identity = identify_person(name)
+    except Exception as e:
+        logger.exception("人物识别失败")
+        yield f"❌ 人物识别失败：{e}", "", 0, gr.update(), gr.update(), gr.update(), gr.update()
+        return
+
+    # 同名消歧：列出候选，等待用户确认
+    if identity.ambiguous and identity.candidates:
+        choices: list[tuple[str, str]] = []
+        for idx, cand in enumerate(identity.candidates):
+            cand_name = cand.get("name", "")
+            cand_era = cand.get("era", "")
+            cand_nation = cand.get("nation", "")
+            cand_summary = cand.get("summary", "")
+            label = f"{idx + 1}. {cand_name}"
+            if cand_era:
+                label += f"（{cand_era}）"
+            if cand_nation:
+                label += f"｜{cand_nation}"
+            if cand_summary:
+                label += f"：{cand_summary[:40]}"
+            choices.append((label, _json.dumps(cand, ensure_ascii=False)))
+        if choices:
+            yield (
+                f"⚠️ 检测到「{name}」可能指向多位不同人物，请选择你指的是哪一位：\n\n"
+                + "\n".join(f"{i + 1}. {c[0]}" for i, c in enumerate(choices)),
+                "",
+                15.0,
+                gr.update(),
+                gr.update(),
+                gr.update(choices=choices, value=choices[0][1], visible=True),
+                gr.update(visible=True),
+            )
+            return
+
+    # 无歧义：直接构建
+    yield from _build_with_identity(name, identity, enable_video=enable_video)
+
+
+def confirm_build_action(selected_json: str, enable_video: bool = False):
+    """
+    用户从同名候选列表中选择具体人物后，继续构建档案。
+    selected_json: 候选条目的 JSON 字符串（Radio 的 value）。
+    """
+    import json as _json
+
+    if not selected_json:
+        yield "⚠️ 请先选择目标人物", "", 0, gr.update(), gr.update(), gr.update(), gr.update()
+        return
+
+    try:
+        cand = _json.loads(selected_json)
+    except Exception as e:
+        yield (
+            f"❌ 无法解析所选人物：{e}", "", 0,
+            gr.update(), gr.update(), gr.update(), gr.update(),
+        )
+        return
+
+    cand_name = str(cand.get("name", "")).strip()
+    if not cand_name:
+        yield "❌ 候选人物缺少姓名", "", 0, gr.update(), gr.update(), gr.update(), gr.update()
+        return
+
+    # 以选定的标准名重新识别，补全检索词（hint 让 LLM 跳过消歧）
+    from core.person_identifier import PersonIdentity, identify_person
+
+    hint = f"{cand_name}（{cand.get('era', '')}，{cand.get('nation', '')}）{cand.get('summary', '')}"
+    identity: PersonIdentity | None = None
+    try:
+        identity = identify_person(cand_name, hint=hint)
+    except Exception as e:
+        logger.warning("确认后识别失败，使用候选基础信息: %s", e)
+        identity = None
+
+    if identity is None or identity.ambiguous or not identity.work_queries:
+        identity = PersonIdentity.from_candidate(cand)
+        identity.work_queries = identity.work_queries or [
+            f"{cand_name} 著作 全文", f"{cand_name} works full text",
+        ]
+        identity.biography_queries = identity.biography_queries or [
+            f"{cand_name} 传记", f"{cand_name} biography",
+        ]
+        identity.history_queries = identity.history_queries or [
+            f"{cand_name} 时代背景 历史", f"{cand_name} historical background",
+        ]
+
+    yield from _build_with_identity(cand_name, identity, enable_video=enable_video)
 
 
 # ==================== 对话 ====================
 
-def chat_action(message: str, history: list, socratic: bool, char: Character | None):
+def chat_action(
+    message: str,
+    history: list,
+    dialogue_mode: str,
+    socratic: bool,
+    char: Character | None,
+):
     """
     流式对话生成器。
     Gradio 6 的 Chatbot history 格式为 list[dict]:
@@ -144,10 +274,12 @@ def chat_action(message: str, history: list, socratic: bool, char: Character | N
 
     from core.chat_engine import stream_chat
 
-    # Gradio 6 的 history 格式与 OpenAI messages 一致，直接用作对话历史
+    # Gradio 6 的 history 格式与 OpenAI messages 一致，直接用作对话历史。
+    # 截断窗口与 chat_engine._build_messages 内部保持一致（10 轮），
+    # 避免 UI 显示 20 轮但 LLM 只看到 10 轮造成体验割裂。
     msg_history: list[dict[str, str]] = [
         {"role": m["role"], "content": str(m.get("content", ""))}
-        for m in history[-20:]
+        for m in history[-10:]
         if m.get("role") in ("user", "assistant") and m.get("content")
     ]
 
@@ -162,7 +294,12 @@ def chat_action(message: str, history: list, socratic: bool, char: Character | N
     partial = ""
     try:
         for chunk in stream_chat(
-            char, message, msg_history, use_rag=True, socratic=socratic
+            char,
+            message,
+            msg_history,
+            use_rag=True,
+            socratic=socratic,
+            dialogue_mode=dialogue_mode,
         ):
             partial += chunk
             history[-1] = {"role": "assistant", "content": partial}
@@ -215,12 +352,32 @@ def build_ui() -> gr.Blocks:
         build_status = gr.Markdown(label="构建过程/采用的资料")
         profile_md = gr.Markdown(label="人物档案")
 
+        # 同名消歧：候选人物选择 + 确认按钮（默认隐藏）
+        candidate_radio = gr.Radio(
+            choices=[],
+            label="🤔 检测到多个同名人物，请选择",
+            visible=False,
+        )
+        confirm_btn = gr.Button("✅ 确认所选人物并继续构建", variant="primary", visible=False)
+
         gr.Markdown("---")
         gr.Markdown("## 💬 对话")
 
         with gr.Row():
-            socratic_toggle = gr.Checkbox(label="苏格拉底式教学模式", value=False)
-            clear_btn = gr.Button("🧹 清空对话", size="sm")
+            dialogue_mode = gr.Radio(
+                choices=[
+                    ("📚 严谨学术讨论", "academic"),
+                    ("☕ 朋友式通俗聊天", "friend"),
+                ],
+                value="academic",
+                label="对话模式",
+                info="学术模式强调论证与材料来源；朋友模式用日常语言和例子讲清观点。",
+                scale=4,
+            )
+            socratic_toggle = gr.Checkbox(
+                label="苏格拉底式教学（通过追问引导思考）", value=False, scale=2
+            )
+            clear_btn = gr.Button("🧹 清空对话", size="sm", scale=1)
 
         chatbot = gr.Chatbot(height=480, label="对话")
         with gr.Row():
@@ -234,13 +391,33 @@ def build_ui() -> gr.Blocks:
         chat_status = gr.Markdown()
 
         # 事件绑定
+        build_outputs = [
+            build_status,
+            profile_md,
+            progress_bar,
+            chatbot,
+            character_state,
+            candidate_radio,
+            confirm_btn,
+        ]
         build_btn.click(
             fn=build_character_action,
             inputs=[name_input],
-            outputs=[build_status, profile_md, progress_bar, chatbot, character_state],
+            outputs=build_outputs,
+        )
+        confirm_btn.click(
+            fn=confirm_build_action,
+            inputs=[candidate_radio],
+            outputs=build_outputs,
         )
 
-        send_inputs = [msg_input, chatbot, socratic_toggle, character_state]
+        send_inputs = [
+            msg_input,
+            chatbot,
+            dialogue_mode,
+            socratic_toggle,
+            character_state,
+        ]
         send_outputs = [chatbot, msg_input]
         send_btn.click(
             fn=chat_action, inputs=send_inputs, outputs=send_outputs

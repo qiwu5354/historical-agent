@@ -18,6 +18,21 @@ from prompts.category_prompts import normalize_categories
 logger = logging.getLogger(__name__)
 
 
+def _coerce_bool(value: Any) -> bool:
+    """
+    容错地把 LLM 输出转成 bool。
+    JSON 规范的 true/false 经 json.loads 已是 Python bool；
+    但 LLM 偶尔会输出字符串 "false"/"true"，此时 bool("false") 会被误判为 True。
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().lower() in ("true", "1", "yes", "ambiguous", "y")
+    return bool(value)
+
+
 @dataclass
 class PersonIdentity:
     """识别出的人物身份信息，用于后续采集与对话。"""
@@ -32,6 +47,8 @@ class PersonIdentity:
     biography_queries: list[str] = field(default_factory=list)
     history_queries: list[str] = field(default_factory=list)
     language: str = "zh"
+    ambiguous: bool = False
+    candidates: list[dict[str, Any]] = field(default_factory=list)
 
     @classmethod
     def from_dict(
@@ -49,6 +66,9 @@ class PersonIdentity:
                 return [value]
             return [str(v).strip() for v in (value or []) if str(v).strip()]
 
+        candidates = [
+            c for c in (data.get("candidates") or []) if isinstance(c, dict)
+        ]
         return cls(
             name=name,
             aliases=_str_list(data.get("aliases")),
@@ -61,6 +81,19 @@ class PersonIdentity:
             biography_queries=_str_list(data.get("biography_queries")),
             history_queries=_str_list(data.get("history_queries")),
             language=str(data.get("language") or "zh").strip() or "zh",
+            ambiguous=_coerce_bool(data.get("ambiguous")),
+            candidates=candidates,
+        )
+
+    @classmethod
+    def from_candidate(cls, candidate: dict[str, Any]) -> "PersonIdentity":
+        """从候选条目构造一个待确认的身份（检索词稍后补全）。"""
+        return cls(
+            name=str(candidate.get("name") or "").strip(),
+            categories=normalize_categories(candidate.get("categories") or []),
+            era=str(candidate.get("era") or "").strip(),
+            nation=str(candidate.get("nation") or "").strip(),
+            summary=str(candidate.get("summary") or "").strip(),
         )
 
     @property
@@ -81,6 +114,8 @@ class PersonIdentity:
             "biography_queries": self.biography_queries,
             "history_queries": self.history_queries,
             "language": self.language,
+            "ambiguous": self.ambiguous,
+            "candidates": self.candidates,
         }
 
 
@@ -97,14 +132,18 @@ def _fallback_identity(input_name: str) -> PersonIdentity:
     )
 
 
-def identify_person(input_name: str) -> PersonIdentity:
+def identify_person(
+    input_name: str, *, hint: str | None = None
+) -> PersonIdentity:
     """
     识别用户输入的人物名。
 
     流程：
       1. 先用轻量搜索获取候选片段。
-      2. 把片段交给 LLM，输出结构化身份信息。
+      2. 把片段交给 LLM，输出结构化身份信息（含同名候选，如存在）。
       3. 如果 LLM 或搜索失败，返回基础身份，保证后续流程仍可继续。
+
+    hint: 用户已确认的目标人物描述（如"卡尔·马克思"），传给 LLM 跳过消歧。
     """
     input_name = input_name.strip()
     if not input_name:
@@ -117,7 +156,7 @@ def identify_person(input_name: str) -> PersonIdentity:
         logger.warning("人物识别前置搜索失败，将仅依赖 LLM 知识: %s", e)
 
     snippets_text = format_raw_snippets(snippets)
-    messages = build_identification_messages(input_name, snippets_text)
+    messages = build_identification_messages(input_name, snippets_text, hint=hint)
     try:
         data = get_llm().chat_json(messages)
     except Exception as e:
@@ -128,7 +167,8 @@ def identify_person(input_name: str) -> PersonIdentity:
     if not identity.categories:
         identity.categories = ["其他"]
     logger.info(
-        "人物识别结果: %s -> %s | 类别=%s",
+        "人物识别结果: %s -> %s | 类别=%s | 歧义=%s 候选数=%d",
         input_name, identity.name, identity.categories,
+        identity.ambiguous, len(identity.candidates),
     )
     return identity

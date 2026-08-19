@@ -9,8 +9,12 @@
 - **人物智能识别**：支持哲学家、心理学家、经济学家、社会学家、历史学家、科学家、作家等
 - **多类别提示词**：LLM 判断人物所属类别，自动选用对应学者思维方式的提示词；一个人物可匹配多个类别
 - **精简资料搜索路线**：先识别人物 → 再搜本人著作、他人传记、历史阶段权威史料 → 最后喂给对话模型
+- **同名消歧**：输入的名字若指向多个同名人物，自动列出候选，确认后再构建，避免张冠李戴
+- **深度网页抓取**：搜索结果不只是摘要，`web_fetcher` 会下载正文，让 RAG 基于真实文章内容检索
 - **多源数据采集**：预置资料库 + 多语言维基 + DuckDuckGo 网页 +（可选）视频字幕
 - **全角色扮演**：人物以其本人立场和思维方式发言，不做现代价值评判，便于沉浸式学习
+- **可调学者维度**：领域模板（自然科学/社会科学/人文/工程/商学）、职业阶段（早期/中期/资深）、沟通风格（学术/教学/面向公众）可叠加定制
+- **对话模式切换**：`academic`（严谨学术论证）/ `friend`（轻松对话）两种模式，可与苏格拉底式教学叠加
 - **RAG 检索增强**：回答基于真实著作/资料原文，双后端自动选择（sentence-transformers 优先，TF-IDF 回退）
 - **构建进度可视化**：人物构建时显示进度条，并展示当前采用的资料/来源分布
 - **苏格拉底式教学**：切换后人物不再直接给答案，而是通过追问引导你自己思考
@@ -59,8 +63,9 @@ python app.py
 
 1. 在输入框输入历史人物/学者名字（如「弗洛伊德」「亚当·斯密」「亚里士多德」）
 2. 点击「构建人物档案」，系统会先识别身份与类别，再自动搜索本人著作、传记、历史背景并构建档案
-3. 档案构建完成后，在下方对话框开始对话
-4. 勾选「苏格拉底式教学模式」可切换到引导式学习
+3. 若名字指向多个同名人物（如多个「王阳明」），会弹出候选列表，选择具体人物后继续
+4. 档案构建完成后，在下方对话框开始对话
+5. 勾选「苏格拉底式教学模式」可切换到引导式学习；「对话模式」可在学术论证 / 轻松对话间切换
 
 ## 📁 项目结构
 
@@ -72,21 +77,29 @@ historical_agent/
 │
 ├── core/                           # 核心逻辑
 │   ├── llm_client.py               # LLM 客户端（OpenAI 兼容，流式 + JSON）
-│   ├── person_identifier.py        # 人物身份/类别识别（联网 + LLM）
+│   ├── person_identifier.py        # 人物身份/类别识别（联网 + LLM，含同名消歧）
 │   ├── search_engine.py            # DuckDuckGo + 多语言维基百科 + 深度资料检索
+│   ├── web_fetcher.py              # 网页正文抓取（httpx + BeautifulSoup，深度 RAG 数据源）
 │   ├── video_transcript.py         # yt-dlp 视频字幕提取（可选）
 │   ├── text_processor.py           # 文本清洗/切分/去重
 │   ├── rag_engine.py               # RAG 双后端（FAISS / TF-IDF）
 │   ├── data_collector.py           # 多源统一采集入口
 │   ├── character_builder.py        # 人物档案构建（LLM 提取）
-│   └── chat_engine.py              # 对话引擎（RAG + 历史 + LLM）
+│   └── chat_engine.py              # 对话引擎（RAG + 历史 + LLM + 对话模式）
 │
 ├── prompts/                        # 提示词
-│   ├── identification_prompt.py    # 人物识别（输出身份、类别、检索词）
+│   ├── identification_prompt.py    # 人物识别（输出身份、类别、检索词、同名候选）
 │   ├── category_prompts.py         # 各学者类别提示词库
 │   ├── extraction_prompts.py       # 档案提取（输出结构化 JSON）
 │   ├── character_prompt.py         # 角色扮演 System Prompt
-│   └── socratic_prompt.py          # 苏格拉底式教学
+│   ├── socratic_prompt.py          # 苏格拉底式教学
+│   ├── domain_templates.py         # 五大领域提示词模板（术语/方法论/认识论/引用/语气）
+│   ├── scholar_profile.py          # 学者档案维度（职业阶段/研究焦点/方法偏好/沟通风格）
+│   ├── scholar_enricher.py         # 学者提示词增强器（融合领域模板 + 阶段 + 风格）
+│   ├── career_stages.py            # 职业阶段修饰词（早期/中期/资深）
+│   ├── communication_styles.py     # 沟通风格修饰词（学术/教学/公众）
+│   ├── dialogue_modes.py           # 对话模式（academic / friend）
+│   └── validation.py               # 提示词验证（静态校验 + 输出一致性自检清单）
 │
 ├── models/                         # 数据模型
 │   ├── character.py                # 人物档案
@@ -117,6 +130,7 @@ historical_agent/
 | 传记评传 | `search_engine.py` | 按 `biography_queries` 搜索他人写的传记/回忆录 |
 | 历史史料 | `search_engine.py` | 按 `history_queries` 搜索时代背景/官方史料/权威档案 |
 | 多语言维基 | `search_engine.py` | 中/英维基补充生平与背景 |
+| 网页正文 | `web_fetcher.py` | 把搜索到的 URL 下载并提取正文（非仅摘要），供深度 RAG 使用 |
 | 预置著作库 | `assets/works/` | 离线可用的精选著作全文，质量最高 |
 | 视频字幕 | `video_transcript.py` | 可选：yt-dlp 提取 YouTube/Bilibili 字幕（较慢，默认关闭） |
 

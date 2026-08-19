@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 from typing import Iterator
 
 from openai import OpenAI
@@ -149,13 +150,16 @@ def _parse_json_lenient(raw: str) -> dict:
         raise LLMError(f"模型输出无法解析为 JSON: {e}") from e
 
 
-# 全局单例（懒加载）
+# 全局单例（懒加载 + 双重检查锁，Gradio 多线程下避免产生多个实例）
 _client_singleton: LLMClient | None = None
+_client_lock = threading.Lock()
 
 
 def get_llm() -> LLMClient:
-    """获取全局 LLM 客户端单例。"""
+    """获取全局 LLM 客户端单例（线程安全）。"""
     global _client_singleton
     if _client_singleton is None:
-        _client_singleton = LLMClient()
+        with _client_lock:
+            if _client_singleton is None:
+                _client_singleton = LLMClient()
     return _client_singleton

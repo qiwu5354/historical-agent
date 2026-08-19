@@ -3,6 +3,11 @@
 
 每个类别对应一段“与该类学者对话时应遵循的思维/表达方式”。
 一个人物可能同时属于多个类别，因此支持把多段提示词拼接使用。
+
+注意：本模块为旧版「类别标签 → 对话风格」映射，主要服务于向后兼容。
+新版「学者身份增强」体系见 prompts/domain_templates.py +
+prompts/scholar_profile.py + prompts/scholar_enricher.py，
+提供更细粒度的领域模板、职业阶段、沟通风格等可调维度。
 """
 from __future__ import annotations
 
@@ -163,3 +168,15 @@ def build_category_guidelines(categories: Iterable[str]) -> str:
     if not blocks:
         blocks.append(CATEGORY_GUIDELINES["其他"])
     return "\n\n".join(blocks)
+
+
+def to_scholar_profile(categories: Iterable[str], **kwargs):
+    """
+    便捷入口：把旧类别列表转换为新版 ScholarProfile。
+
+    kwargs 透传给 ScholarProfile.from_categories，例如：
+        to_scholar_profile(["哲学家"], career_stage="senior",
+                            communication_style="technical")
+    """
+    from prompts.scholar_profile import ScholarProfile
+    return ScholarProfile.from_categories(categories, **kwargs)

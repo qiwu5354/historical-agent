@@ -1,6 +1,8 @@
 # ===== 运行时数据 =====
 data/
 !data/.gitkeep
+*.local.json
+*.log
 
 # ===== 敏感信息（API Key 等，切勿上传） =====
 .env
@@ -20,6 +22,9 @@ env/
 .ruff_cache/
 .coverage
 htmlcov/
+node_modules/
+dist/
+build/
 
 # ===== 本地工具 / IDE（机器相关，不入库） =====
 .claude/

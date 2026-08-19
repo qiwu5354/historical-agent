@@ -129,11 +129,13 @@ def to_documents(
     title: str = "",
     era: str = "",
     language: str = "zh",
+    category: str = "",
     cleaner=None,
 ) -> list[Document]:
     """
     把一段原始文本清洗+切分后，包装成 Document 列表。
     cleaner: 可选的清洗函数（clean_html / clean_subtitle / None）
+    category: 资料类别（CATEGORY_*），用于前端分类展示与 RAG 溯源
     """
     if cleaner is not None:
         raw_text = cleaner(raw_text)
@@ -151,6 +153,7 @@ def to_documents(
                 era=era,
                 language=language,
                 content=chunk,
+                category=category,
             )
         )
     return docs

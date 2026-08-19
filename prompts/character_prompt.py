@@ -3,11 +3,18 @@
 
 构建对话用的 System Prompt，让 LLM 以该人物的思维框架进行
 基于证据的分析和推断；并根据 LLM 识别出的学者类别，自动追加对应的方法论提示词。
+
+若调用方传入 ScholarProfile（学者身份参数集），会启用增强模式：
+在原角色档案基础上叠加领域模板、职业阶段、沟通风格等可调维度。
+未传入时退化为旧逻辑（仅用 build_category_guidelines）。
 """
 from __future__ import annotations
 
 from prompts import safe_format
 from prompts.category_prompts import build_category_guidelines
+from prompts.scholar_enricher import enrich_with_character
+from prompts.scholar_profile import ScholarProfile
+from prompts.validation import build_output_checklist
 from models.character import Character
 
 
@@ -77,20 +84,44 @@ SYSTEM_PROMPT_TEMPLATE = """你现在就是{character_name}本人。不是扮演
 
 {category_guidelines}
 
+{scholar_enrichment}
+
 ## 回答要求
 1. 用{character_name}的语言风格、思维方式和立场——但核心是**分析和推断**，不是复读教科书
 2. 用中文回答，除非用户用其他语言提问
 3. 回答简洁有力，宁可犀利也不冗长，宁可具体也不空泛
 4. 如果用户的问题和你直接相关（你的理论、你的研究、你的时代），用第一手材料回应
 5. 如果用户问的是你时代之后的事情，用你的思维框架给出你的分析，同时承认这超出你的直接经验
-6. 引用原文时，引用是为了支撑你的论点，不是为了凑字数——引用之后必须跟你的分析"""
+6. 引用原文时，引用是为了支撑你的论点，不是为了凑字数——引用之后必须跟你的分析
+
+{output_checklist}"""
 
 
-def build_system_prompt(character: Character) -> str:
+def build_system_prompt(
+    character: Character,
+    *,
+    scholar_profile: ScholarProfile | None = None,
+) -> str:
     """构建角色扮演的 System Prompt。
 
     会根据 character.categories 自动选择并拼接对应学者类别的提示词。
+
+    可选参数：
+      scholar_profile: 若传入，启用学者身份增强模式（领域模板 + 职业阶段 +
+                       沟通风格 + 自检清单）；不传则退化为旧逻辑。
+                       调用方也可让本函数自动从 categories 推导默认 profile：
+                       传入 ScholarProfile.from_categories(character.categories) 即可。
     """
+    # 若调用方未传 profile，但希望启用增强模式，可显式传 from_categories 推导结果；
+    # 这里仅当 profile 为 None 时使用旧逻辑。
+    if scholar_profile is not None:
+        enrichment = enrich_with_character(scholar_profile)
+        output_checklist = build_output_checklist(character.name, scholar_profile)
+    else:
+        # 旧逻辑：只用旧类别指南，不附加增强块与自检清单
+        enrichment = ""
+        output_checklist = ""
+
     return safe_format(
         SYSTEM_PROMPT_TEMPLATE,
         character_name=character.name,
@@ -106,4 +137,6 @@ def build_system_prompt(character: Character) -> str:
         stance_guideline=character.stance_guideline or "以你本人的自然风格说话，直接而深刻",
         analysis_guidelines=safe_format(ANALYSIS_GUIDELINES, character_name=character.name),
         category_guidelines=build_category_guidelines(character.categories),
+        scholar_enrichment=enrichment,
+        output_checklist=output_checklist,
     )

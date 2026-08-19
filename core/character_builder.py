@@ -11,11 +11,27 @@ from __future__ import annotations
 import logging
 from typing import Iterator
 
-from core.data_collector import collect_all_sources, summarize_sources
+from core.data_collector import (
+    collect_all_sources,
+    format_collected_materials,
+    summarize_sources,
+)
 from core.llm_client import get_llm, LLMError
 from core.person_identifier import PersonIdentity, identify_person
 from models.character import Character
-from models.document import Document, SOURCE_WORK, SOURCE_LABELS
+from models.document import (
+    CATEGORY_BIOGRAPHY,
+    CATEGORY_HISTORY,
+    CATEGORY_VIDEO,
+    CATEGORY_WIKI,
+    CATEGORY_WORK,
+    CATEGORY_WEB,
+    CATEGORY_LABELS,
+    SOURCE_WORK,
+    SOURCE_WIKI,
+    SOURCE_VIDEO,
+    Document,
+)
 from prompts.extraction_prompts import build_extraction_messages
 from prompts.category_prompts import normalize_categories
 
@@ -24,12 +40,14 @@ logger = logging.getLogger(__name__)
 
 # 喂给 LLM 做档案提取的最大字符数（控制 token 成本）
 MAX_MATERIAL_CHARS = 12000
-# 各来源类型用于提取的配额（优先著作）
-SOURCE_QUOTA = {
-    SOURCE_WORK: 5000,      # 著作权重最高
-    "wiki": 3000,
-    "web": 2000,
-    "video_subtitle": 2000,
+# 各资料类别用于提取的配额（优先本人著作，其次传记/史料）
+CATEGORY_QUOTA = {
+    CATEGORY_WORK: 5000,        # 本人著作/自传权重最高
+    CATEGORY_BIOGRAPHY: 3000,   # 他人传记/评传
+    CATEGORY_HISTORY: 2500,     # 权威史料/时代背景
+    CATEGORY_WIKI: 2000,        # 百科
+    CATEGORY_VIDEO: 1500,       # 视频字幕
+    CATEGORY_WEB: 1000,         # 其他网页
 }
 
 
@@ -37,22 +55,32 @@ SOURCE_QUOTA = {
 
 def select_representative_materials(docs: list[Document]) -> str:
     """
-    从采集到的所有文档中，按来源类型配额选出代表性段落，拼接成给 LLM 的材料。
-    优先选著作原文，其次百科、网页、字幕。
+    从采集到的所有文档中，按资料类别配额选出代表性段落，拼接成给 LLM 的材料。
+    优先本人著作/自传，其次他人传记、权威史料、百科、视频、网页。
+    每个分组都带中文类别标签，让 LLM 明确知道材料属于哪一类资料。
     """
-    # 按来源分组
-    by_source: dict[str, list[Document]] = {}
+    # 按资料类别分组（旧数据无 category 时按来源类型回退）
+    by_category: dict[str, list[Document]] = {}
     for d in docs:
-        by_source.setdefault(d.source_type, []).append(d)
+        cat = d.category or _fallback_category(d)
+        by_category.setdefault(cat, []).append(d)
 
+    order = [
+        CATEGORY_WORK,
+        CATEGORY_BIOGRAPHY,
+        CATEGORY_HISTORY,
+        CATEGORY_WIKI,
+        CATEGORY_VIDEO,
+        CATEGORY_WEB,
+    ]
     materials: list[str] = []
-    for source_type in (SOURCE_WORK, "wiki", "web", "video_subtitle"):
-        group = by_source.get(source_type, [])
+    for cat in order:
+        group = by_category.get(cat, [])
         if not group:
             continue
-        quota = SOURCE_QUOTA.get(source_type, 1500)
-        label = SOURCE_LABELS.get(source_type, source_type)
-        buf = f"\n\n=====【来源：{label}】=====\n"
+        quota = CATEGORY_QUOTA.get(cat, 1500)
+        label = CATEGORY_LABELS.get(cat, cat)
+        buf = f"\n\n=====【资料类别：{label}】=====\n"
         used = 0
         for doc in group:
             if used >= quota:
@@ -67,6 +95,22 @@ def select_representative_materials(docs: list[Document]) -> str:
     if len(full) > MAX_MATERIAL_CHARS:
         full = full[:MAX_MATERIAL_CHARS] + "\n\n[...资料过长，已截断...]"
     return full
+
+
+def _fallback_category(doc: Document) -> str:
+    """旧数据兼容：无 category 时根据来源类型/详情推断类别。"""
+    detail = doc.source_detail or ""
+    if doc.source_type == SOURCE_WORK or "著作" in detail:
+        return CATEGORY_WORK
+    if "传记" in detail:
+        return CATEGORY_BIOGRAPHY
+    if "史料" in detail:
+        return CATEGORY_HISTORY
+    if doc.source_type == SOURCE_WIKI:
+        return CATEGORY_WIKI
+    if doc.source_type == SOURCE_VIDEO:
+        return CATEGORY_VIDEO
+    return CATEGORY_WEB
 
 
 # ==================== 从 JSON 构建 Character ====================
@@ -168,6 +212,7 @@ def build_character(
 def build_character_streaming(
     character_name: str,
     *,
+    identity: PersonIdentity | None = None,
     enable_video: bool = True,
 ) -> Iterator[tuple[str, float]]:
     """
@@ -176,32 +221,41 @@ def build_character_streaming(
     yield (进度文本, 进度百分比 0~100)；
     生成器结束时 return (Character, docs)，调用方通过 StopIteration.value 取得返回值。
 
-    新流程：
-      1. 联网 + LLM 识别人物身份和学者类别
-      2. 按识别结果搜索本人著作、传记、历史背景
-      3. 用 LLM 提炼结构化人物档案
+    四步链路：
+      Step 1. 联网 + LLM 识别人物身份（已确认 identity 则跳过）
+      Step 2. 搜索本人著作/自传，并抓取网页正文
+      Step 3. 搜索他人传记/评传，并抓取网页正文
+      Step 4. 搜索权威史料/时代背景，并抓取网页正文
+      Step 5. 把所有资料交给 LLM 提炼结构化人物档案
     """
     character_name = character_name.strip()
-    yield f"🔍 正在识别人物：「{character_name}」...\n", 5.0
+    if identity is None:
+        yield f"🔍 Step 1：正在联网识别人物「{character_name}」...\n", 5.0
 
-    # 1. 人物识别
-    try:
-        identity = identify_person(character_name)
-    except Exception as e:
-        logger.exception("人物识别失败")
-        raise RuntimeError(f"人物识别失败：{e}") from e
+        # 1. 人物识别
+        try:
+            identity = identify_person(character_name)
+        except Exception as e:
+            logger.exception("人物识别失败")
+            raise RuntimeError(f"人物识别失败：{e}") from e
 
     yield (
-        f"✅ 已识别：{identity.name}\n"
+        f"✅ 已确认人物：{identity.name}\n"
         f"   - 类别：{'、'.join(identity.categories) or '未分类'}\n"
         f"   - 简介：{identity.summary or '（无）'}\n\n",
-        25.0,
+        20.0,
     )
 
-    # 2. 深度资料采集
-    yield "🔎 正在搜索本人著作、传记、历史背景资料...\n", 30.0
+    # 2-4. 按识别结果搜索三类资料，并抓取网页正文
+    yield (
+        "🔎 Step 2：检索本人著作/自传\n"
+        "🔎 Step 3：检索他人传记/评传\n"
+        "🔎 Step 4：检索权威史料/时代背景\n"
+        "   正在抓取网页正文（而非仅搜索摘要）...\n",
+        25.0,
+    )
     if enable_video:
-        yield "  - 视频字幕（如启用且可用）...\n", 32.0
+        yield "  - 视频字幕（如启用且可用）...\n", 27.0
 
     docs = collect_all_sources(
         identity.name,
@@ -213,9 +267,10 @@ def build_character_streaming(
         src = summarize_sources(docs)
         src_str = "、".join(f"{k}:{v}段" for k, v in src.items())
         yield f"📊 来源分布：{src_str}\n\n", 68.0
+        yield format_collected_materials(docs) + "\n\n", 69.0
 
-    # 3. 提取档案
-    yield "🧠 正在用 LLM 提炼核心思想、构建人物档案...\n", 70.0
+    # 5. 把资料交给 LLM 提炼档案
+    yield "🧠 Step 5：正在把采集到的资料交给 LLM 解析、提炼核心思想、构建人物档案...\n", 70.0
     char, _ = build_character(
         identity.name,
         identity=identity,

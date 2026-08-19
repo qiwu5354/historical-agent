@@ -10,6 +10,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import subprocess
 import tempfile
@@ -17,7 +18,7 @@ from pathlib import Path
 
 from config import settings, CACHE_DIR
 from core.text_processor import clean_subtitle, split_paragraphs
-from models.document import Document, SOURCE_VIDEO
+from models.document import CATEGORY_VIDEO, Document, SOURCE_VIDEO
 
 logger = logging.getLogger(__name__)
 
@@ -191,16 +192,19 @@ def collect_video_transcripts(character_name: str) -> list[Document]:
         if len(text) < 50:
             continue
         chunks = split_paragraphs(text)
+        # 用 URL 的短哈希区分不同视频，避免不同视频但相同 idx 撞 doc_id
+        url_hash = hashlib.sha1(url.encode("utf-8")).hexdigest()[:8]
         for idx, chunk in enumerate(chunks):
             docs.append(
                 Document(
-                    doc_id=f"video-{character_name}-{platform}-{idx}",
+                    doc_id=f"video-{character_name}-{platform}-{url_hash}-{idx}",
                     character_name=character_name,
                     source_type=SOURCE_VIDEO,
                     source_detail=f"{platform}: {url[:80]}",
                     title=f"{character_name} 视频字幕",
                     language="zh",
                     content=chunk,
+                    category=CATEGORY_VIDEO,
                 )
             )
         logger.info("视频字幕采集成功: %s (%d 段)", url, len(chunks))
