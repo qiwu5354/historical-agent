@@ -26,3 +26,6 @@ scikit-learn
 
 # 工具
 python-dotenv
+
+# 测试（可选，运行 python -m pytest tests -q 时需要）
+pytest

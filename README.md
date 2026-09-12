@@ -48,6 +48,18 @@ LLM_MODEL=qwen3-turbo
 
 也支持通义千问、智谱 GLM、DeepSeek 等，只需修改 `LLM_BASE_URL` 和 `LLM_MODEL`。
 
+> ⚠️ **务必保留这两个开关**（`.env.example` 中已带默认值），否则很容易踩到「模型返回空内容」的坑：
+>
+> ```ini
+> LLM_DISABLE_THINKING=1   # 关闭「思考模式」（默认开）
+> LLM_MAX_TOKENS=4096      # 输出预算，长档案提取建议 ≥4096
+> ```
+>
+> `qwen3.5+`/`qwen3.7-flash`/`qwen3.8`、`GLM-5` 等**混合思考模型默认开启思考**，
+> 思考内容（`reasoning_content`）与正文（`content`）**共享 `max_tokens` 预算**。
+> 预算被思考吃光时会出现 HTTP 200 但正文为空/被截断，日志报
+> `Expecting value: line 1 column 1 (char 0)`。详见「常见问题」。
+
 > 🔒 **安全提醒**：`.env` 已被 `.gitignore` 排除，请**不要**手动把它加入 Git 或上传到 GitHub，
 > 其中包含你的 API Key。仓库中只提交 `.env.example`（占位符 Key）。
 
@@ -72,8 +84,13 @@ python app.py
 ```
 historical_agent/
 ├── app.py                          # Gradio 主入口（Web UI）
+├── launcher.py                     # 一键启动辅助脚本（检查 .env / 依赖 / 端口后启动）
+├── 一键启动.bat                     # Windows 双击启动
 ├── config.py                       # 配置管理
 ├── requirements.txt
+│
+├── tests/                          # 回归测试
+│   └── test_llm_client.py          # LLM 客户端：思考模式 / 空正文重试 / 容错解析
 │
 ├── core/                           # 核心逻辑
 │   ├── llm_client.py               # LLM 客户端（OpenAI 兼容，流式 + JSON）
@@ -147,9 +164,12 @@ historical_agent/
 | `LLM_API_KEY` | - | LLM API 密钥（必填） |
 | `LLM_BASE_URL` | dashscope | OpenAI 兼容接口地址 |
 | `LLM_MODEL` | - | 模型名 |
-| `LLM_TEMPERATURE` | 0.7 | 对话温度 |
-| 视频字幕采集 | 关闭 | 后台可选能力，前端默认不启用 |
+| `LLM_TEMPERATURE` | 0.7 | 对话温度（档案提取等严肃任务内部固定 0.2） |
+| `LLM_DISABLE_THINKING` | 1 | 关闭「思考模式」。混合思考模型（qwen3.5+/qwen3.7-flash、GLM-5 等）思考默认开启，会与正文争抢 `max_tokens`，故默认关闭；设为 `0` 恢复，但需同时把 `LLM_MAX_TOKENS` 调到 8192 以上 |
+| `LLM_MAX_TOKENS` | 4096 | 单次回复 token 预算（思考 token 也计入）。档案提取要输出 `core_thought`(500字) 等长字段，不建议低于 4096 |
 | `RAG.top_k` | 5 | 每次检索返回段落数 |
+| 视频字幕采集 | 关闭 | 后台可选能力，前端默认不启用 |
+| `HTTPS_PROXY` / `HTTP_PROXY` | 空 | 采集维基/DDG/网页所需的网络代理；**不配置则直连**，国内环境通常需要设置（如 `http://127.0.0.1:7890`） |
 
 ## 🛡️ 立场说明
 
@@ -168,6 +188,39 @@ A: 自动选择。控制台日志会显示 `[FAISS]` 或 `[TF-IDF]`。torch 可�
 
 **Q: DuckDuckGo 搜索失败**
 A: DuckDuckGo 偶尔限流，属正常现象，不影响其他数据源采集。
+
+**Q: 日志报 `模型输出无法解析为 JSON: Expecting value: line 1 column 1 (char 0)`，且 `原始内容(前500字):` 后面一片空白**
+A: 这不是网络问题，而是**模型返回了空正文**（HTTP 200，但 `message.content` 是空字符串，
+所以 `json.loads("")` 报 line 1 column 1）。根因是**思考模式吃光了 `max_tokens` 预算**：
+
+- `qwen3.5+` / `qwen3.7-flash` / `qwen3.8` / `GLM-5` 等是**混合思考模型，思考默认开启**；
+- 思考内容走 `reasoning_content` 字段，但**与正文共享 `max_tokens` 预算**；
+- 档案提取要输出 `core_thought`(500字) 等多个长字段，2048 的预算被思考吃光后，正文就没了。
+
+修复方式（本仓库已内置）：
+
+1. `.env` 里保持 `LLM_DISABLE_THINKING=1`：客户端会自动关闭思考模式
+   （DashScope 发 `enable_thinking=false`，DeepSeek 官方端点发 `thinking={"type":"disabled"}`，
+   其它第三方端点自动跳过该参数，不会因参数不识别报 400）；
+2. `LLM_MAX_TOKENS` 保持 `4096` 或更高；
+3. 即使遇到空正文，客户端也会**自动加大 `max_tokens` 并追加 `/no_think` 重试一次**，
+   仍失败则抛出带 `finish_reason` / 思考长度 / token 用量的明确错误，便于定位；
+4. 若用的是**纯思考模型**（`qwen3-*-thinking`、`deepseek-r1` 等，思考不可关闭），
+   请换成混合思考模型，或把 `LLM_MAX_TOKENS` 提到 8192 以上。
+
+**Q: 日志显示 `共 0 段资料`、来源分布全是 0**
+A: 这是采集环节没抓到任何资料（维基 / DuckDuckGo / 网页抓取全线为 0），随后会退化为
+「用 LLM 内置知识构建（质量较低）」。通常是网络无法直连维基/DDG，请配置代理
+（`HTTPS_PROXY=http://127.0.0.1:7890`，端口按你自己的代理软件填），并确认代理进程已启动。
+
+## ✅ 测试
+
+```bash
+python -m pytest tests -q
+```
+
+覆盖 LLM 客户端最易出错的几条链路：思考开关按厂商方言生成、空正文自动重试与预算放大、
+端点拒绝扩展参数时回退、以及各类「带前后缀 / 被截断」的 JSON 容错解析。全部用例不联网即可运行。
 
 ---
 

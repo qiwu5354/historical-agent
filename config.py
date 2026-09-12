@@ -8,9 +8,12 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
+# .env 固定在项目根目录读取，避免从别的目录启动时读不到配置
+_ENV_FILE = Path(__file__).parent.resolve() / ".env"
+
 try:
     from dotenv import load_dotenv
-    load_dotenv()
+    load_dotenv(_ENV_FILE)
 except ImportError:
     pass
 
@@ -56,7 +59,15 @@ class LLMConfig:
     ))
     model: str = field(default_factory=lambda: os.getenv("LLM_MODEL", "qwen3-turbo"))
     temperature: float = field(default_factory=lambda: _env_float("LLM_TEMPERATURE", 0.7))
-    max_tokens: int = field(default_factory=lambda: _env_int("LLM_MAX_TOKENS", 2048))
+    # 单次回复的最大 token 预算。注意：混合思考模型的「思考」与「正文」共享该预算，
+    # 2048 在长档案提取场景下容易被思考吃光导致正文为空，故默认给到 4096。
+    max_tokens: int = field(default_factory=lambda: _env_int("LLM_MAX_TOKENS", 4096))
+    # 是否关闭「思考模式」。qwen3.5+/qwen3.7-flash、GLM-5 等默认开启思考，
+    # 思考 token 会挤占 max_tokens 导致正文被截断甚至为空，故默认关闭。
+    # 想要更高质量推理可设为 0，但同时务必把 LLM_MAX_TOKENS 调到 8192 以上。
+    disable_thinking: bool = field(
+        default_factory=lambda: os.getenv("LLM_DISABLE_THINKING", "1") != "0"
+    )
     # 用于档案提取/翻译等"严肃"任务的低温度模型
     serious_temperature: float = 0.2
     # 流式输出的 chunk 超时（秒）
