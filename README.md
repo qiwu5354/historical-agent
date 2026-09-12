@@ -71,6 +71,9 @@ python app.py
 
 浏览器打开 http://127.0.0.1:7860
 
+> 采集不到资料时先自检：`python launcher.py health`
+> （逐项检查预置著作库 / 网页抓取 / 网页检索 / 维基百科是否连通）
+
 ### 4. 使用
 
 1. 在输入框输入历史人物/学者名字（如「弗洛伊德」「亚当·斯密」「亚里士多德」）
@@ -90,7 +93,8 @@ historical_agent/
 ├── requirements.txt
 │
 ├── tests/                          # 回归测试
-│   └── test_llm_client.py          # LLM 客户端：思考模式 / 空正文重试 / 容错解析
+│   ├── test_llm_client.py          # LLM 客户端：思考模式 / 空正文重试 / 容错解析
+│   └── test_data_sources.py        # 数据源采集：httpx 参数兼容 / 代理 / 抓取 / 兜底检索
 │
 ├── core/                           # 核心逻辑
 │   ├── llm_client.py               # LLM 客户端（OpenAI 兼容，流式 + JSON）
@@ -209,9 +213,49 @@ A: 这不是网络问题，而是**模型返回了空正文**（HTTP 200，但 `
    请换成混合思考模型，或把 `LLM_MAX_TOKENS` 提到 8192 以上。
 
 **Q: 日志显示 `共 0 段资料`、来源分布全是 0**
-A: 这是采集环节没抓到任何资料（维基 / DuckDuckGo / 网页抓取全线为 0），随后会退化为
-「用 LLM 内置知识构建（质量较低）」。通常是网络无法直连维基/DDG，请配置代理
-（`HTTPS_PROXY=http://127.0.0.1:7890`，端口按你自己的代理软件填），并确认代理进程已启动。
+A: 这是采集环节没抓到任何资料（维基 / 网页抓取全线为 0），随后会退化为
+「用 LLM 内置知识构建（质量较低）」。
+
+**第一步：先跑自检**，它会逐项告诉你到底哪一环不通：
+
+```bash
+python launcher.py health
+```
+
+输出示例：
+
+```
+数据源自检：
+  ✅ 预置著作库：目录 .../assets/works
+  ✅ 网页抓取：成功抓取 686 字（https://www.iana.org/help/example-domains）
+  ✅ 网页检索：网页检索可用（返回 2 条）
+  ❌ 维基百科：维基百科不可达（wikipediaapi 与 REST 均失败）。当前未配置代理（直连）...
+```
+
+**第二步：按自检结果处理**
+
+| 失败项 | 原因 | 处理 |
+|--------|------|------|
+| 网页抓取 / 维基百科失败 | 未配代理，或代理没启动（维基、DuckDuckGo 在国内普遍无法直连） | 在 `.env` 里设 `HTTPS_PROXY=http://127.0.0.1:7890`（端口按你的代理软件填），然后**确认代理软件已经在运行** |
+| 网页检索失败 | DuckDuckGo 限流且 Bing 兜底也不可达 | 同上；本项目已内置 Bing RSS 兜底源，只要网络通一般都能拿到结果 |
+| 全部都失败 | 代理地址写错或没启动 | 用 `curl -x http://127.0.0.1:7890 https://www.google.com` 验证代理本身可用 |
+
+> 代理只写 `127.0.0.1:7890` 也可以（会自动补 `http://`）。支持 `HTTPS_PROXY` /
+> `HTTP_PROXY` / `ALL_PROXY`，大小写不限。
+
+**已修复的相关缺陷**（旧版本必然拿不到任何网页资料）：
+
+- `web_fetcher` 曾用 `httpx.Client(proxies=...)`，而 httpx ≥ 0.28 已移除该参数，
+  每次抓取都抛 `TypeError`；该异常不在 `except httpx.HTTPError` 覆盖范围内，
+  于是**整条采集链路静默失败**，表现为「共 0 段资料」。
+- `wikipediaapi` 的 kwargs 也曾传入 `proxies={...}`，同样会抛 `TypeError`，
+  导致维基采集全线失败。现已改为 httpx 0.28 支持的 `proxy="http://host:port"`。
+- DuckDuckGo 客户端不会自己读 `HTTP(S)_PROXY` 环境变量，现已显式传入代理。
+- 新增 Bing RSS 兜底检索源：DuckDuckGo 返回空时自动改走 Bing，显著提高命中率。
+- 新增维基 REST 摘要兜底：`wikipediaapi`（`action=query`）不可达时改用
+  `/api/rest_v1/` 接口，多一条拿资料的路径。
+- 新增 `python launcher.py health` 数据源自检，启动时也会在后台打印不可用项，
+  不再让「共 0 段资料」这种问题无声发生。
 
 ## ✅ 测试
 
@@ -219,8 +263,11 @@ A: 这是采集环节没抓到任何资料（维基 / DuckDuckGo / 网页抓取�
 python -m pytest tests -q
 ```
 
-覆盖 LLM 客户端最易出错的几条链路：思考开关按厂商方言生成、空正文自动重试与预算放大、
-端点拒绝扩展参数时回退、以及各类「带前后缀 / 被截断」的 JSON 容错解析。全部用例不联网即可运行。
+覆盖 LLM 客户端与数据源采集两条最易出错的链路：
+思考开关按厂商方言生成、空正文自动重试与预算放大、端点拒绝扩展参数时回退、
+各类「带前后缀 / 被截断」的 JSON 容错解析；httpx 参数兼容性（`proxies` 已被移除）、
+代理规范化、传输错误重试、wikipediaapi kwargs 兼容性、Bing RSS 与维基 REST 兜底解析。
+**全部用例不联网即可运行**（httpx 用 MockTransport 打桩）。
 
 ---
 

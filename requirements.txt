@@ -7,7 +7,7 @@ uvicorn
 openai>=1.0
 
 # 搜索 & 数据源
-duckduckgo-search>=6.0
+ddgs                              # DuckDuckGo 搜索（新包名；旧名 duckduckgo-search 会告警）
 wikipedia-api
 yt-dlp>=2024.0                    # 视频字幕（YouTube/Bilibili等）
 

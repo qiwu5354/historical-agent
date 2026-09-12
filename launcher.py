@@ -38,7 +38,7 @@ URL = f"http://{HOST}:{PORT}"
 # 缺失或损坏时程序会自动回退到 TF-IDF 检索，不应因此触发全量重装）
 REQUIRED_MODULES = [
     "gradio", "fastapi", "uvicorn", "openai", "httpx", "bs4", "lxml",
-    "tenacity", "dotenv", "sklearn", "faiss", "duckduckgo_search",
+    "tenacity", "dotenv", "sklearn", "faiss", "ddgs",
     "wikipediaapi", "yt_dlp",
 ]
 
@@ -180,11 +180,31 @@ def run_app() -> int:
         return 130
 
 
+def check_data_sources() -> int:
+    """数据源连通性自检（打印报告，不阻断启动）。"""
+    hr()
+    out("   数据源连通性自检")
+    hr()
+    out()
+    try:
+        from core.data_collector import format_health_report, health_check
+
+        results = health_check()
+        out(format_health_report(results))
+        return 0 if all(ok for _, ok, _ in results) else 2
+    except Exception as e:  # noqa: BLE001
+        out(f"[错误] 自检执行失败：{type(e).__name__}: {e}")
+        return 1
+
+
 def main() -> int:
     hr()
     out("   历史人物 / 学者对话 Agent  ——  一键启动")
     hr()
     out()
+
+    if len(sys.argv) > 1 and sys.argv[1] == "health":
+        return check_data_sources()
 
     if not check_env():
         return 1

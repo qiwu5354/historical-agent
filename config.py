@@ -18,9 +18,23 @@ except ImportError:
     pass
 
 
-# ===== 代理设置（仅在显式配置时生效；未配置则直连，不强行指定本地代理）=====
-# 读到后即可直接使用，无需 setdefault（旧代码因 _PROXY 已存在，setdefault 是 no-op）。
-_PROXY = os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY") or ""
+# ===== 代理设置 =====
+# 依次读取 HTTPS_PROXY / HTTP_PROXY / ALL_PROXY（大小写均可），未配置则为空字符串。
+# 空字符串表示「直连」，不强行指定本地代理；但注意 httpx 默认 trust_env=True，
+# 因此即使这里为空，系统/环境里已存在的代理变量仍会被底层库使用。
+_PROXY_ENV_KEYS = ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy")
+
+
+def _resolve_proxy() -> str:
+    """从环境变量解析采集用代理地址；未配置返回空字符串。"""
+    for key in _PROXY_ENV_KEYS:
+        value = (os.getenv(key) or "").strip()
+        if value:
+            return value
+    return ""
+
+
+_PROXY = _resolve_proxy()
 
 
 def _env_float(key: str, default: float) -> float:
@@ -77,8 +91,8 @@ class LLMConfig:
 @dataclass
 class SearchConfig:
     """数据源采集配置"""
-    # 代理（访问海外站点需要；空字符串 = 直连）
-    proxy: str = field(default_factory=lambda: os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY", ""))
+    # 代理（访问维基/DDG 等海外站点需要；空字符串 = 直连，交给 httpx trust_env 决定）
+    proxy: str = field(default_factory=_resolve_proxy)
     # DuckDuckGo
     ddg_max_results: int = 10
     # Wikipedia 多语言：人物母语映射（值是维基语言代码）
@@ -91,8 +105,12 @@ class SearchConfig:
     video_platforms: list[str] = field(
         default_factory=lambda: ["youtube.com", "bilibili.com"]
     )
-    # wikipedia（内置重试已关闭，此值为单次请求超时；站点不可达时快速跳过）
+    # wikipedia（wikipediaapi 内部自带重试次数，这里为单次请求超时；站点不可达时快速跳过）
     wiki_timeout: float = 8.0          # 单次请求超时（秒）
+    wiki_max_retries: int = 0          # 传输错误重试次数（0 = 快速失败，避免单次放大 4 倍）
+    # 网页抓取：单页超时与重试
+    fetch_timeout: float = 20.0
+    fetch_retries: int = 1             # 传输错误重试次数（首次之外再试几次）
 
 
 @dataclass

@@ -25,10 +25,11 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 
+import httpx
 import wikipediaapi
 
 from config import settings
-from core.web_fetcher import fetch_url
+from core.web_fetcher import _normalize_proxy, fetch_url, http_client_config, proxy_hint
 from models.document import (
     CATEGORY_BIOGRAPHY,
     CATEGORY_HISTORY,
@@ -47,17 +48,33 @@ _WIKI_USER_AGENT = "HistoricalAgent/1.0 (educational history dialogue; contact: 
 
 
 def _wiki_kwargs() -> dict:
-    """传递给 wikipediaapi.Wikipedia 的 httpx 参数（代理、超时、无重试）。"""
+    """
+    传递给 wikipediaapi.Wikipedia 的参数。
+
+    wikipediaapi 会把未知 kwargs 直接转发给 httpx.Client，因此这里**只能**放
+    httpx 认识的参数；旧代码传的 `proxies={...}` 在 httpx ≥ 0.28 上会抛
+    `TypeError: unexpected keyword argument 'proxies'`，导致维基采集全线失败。
+    正确写法是 `proxy="http://host:port"`（单个地址字符串）。
+    `max_retries` / `retry_wait` 是 wikipediaapi 自己的参数，仍然可用。
+    """
     kwargs: dict = {
         "timeout": settings.search.wiki_timeout,
         # 维基只是补充数据源，站点不可达时应快速失败，不要把单次超时放大 4 倍。
-        "max_retries": 0,
+        "max_retries": settings.search.wiki_max_retries,
         "retry_wait": 0.0,
     }
-    proxy = settings.search.proxy
+    proxy = _normalize_proxy(settings.search.proxy)
     if proxy:
-        kwargs["proxies"] = {"http://": proxy, "https://": proxy}
+        kwargs["proxy"] = proxy
     return kwargs
+
+
+# ==================== 维基 REST 摘要兜底（不依赖 wikipediaapi）====================
+
+def _quote(title: str) -> str:
+    from urllib.parse import quote
+
+    return quote(title.replace(" ", "_"), safe="")
 
 
 @dataclass
@@ -74,6 +91,52 @@ class RawSnippet:
     url: str = ""
     language: str = "zh"
     category: str = ""          # 资料类别 CATEGORY_*（work/biography/history/wiki/web）
+
+
+def _wiki_rest_summary(
+    lang: str, title: str, *, category: str, source_detail: str,
+    character_name: str,
+) -> list[RawSnippet]:
+    """
+    用 MediaWiki REST API 直接取词条摘要，作为 wikipediaapi 失败时的兜底。
+
+    背景：wikipediaapi 走的是 `action=query` 接口，部分网络环境只放行
+    `/api/rest_v1/`；多一条路径就多一次拿到资料的机会。失败静默返回空列表。
+    """
+    if not title:
+        return []
+    url = f"https://{lang}.wikipedia.org/api/rest_v1/page/summary/{_quote(title)}"
+    try:
+        with httpx.Client(**http_client_config(timeout=settings.search.wiki_timeout)) as client:
+            resp = client.get(url)
+        if resp.status_code != 200:
+            logger.debug("维基 REST[%s] %s 返回 %d", lang, title, resp.status_code)
+            return []
+        data = resp.json()
+    except Exception as e:  # noqa: BLE001
+        logger.debug("维基 REST[%s] %s 失败: %s", lang, title, e)
+        return []
+
+    extract = (data.get("extract") or "").strip()
+    if len(extract) < 50:
+        return []
+    page_title = data.get("title") or title
+    content = f"{data.get('description') or ''}\n\n{extract}".strip()
+    urls = data.get("content_urls") or {}
+    full_url = ((urls.get("desktop") or {}).get("page")) or url
+    logger.info("维基REST[%s]获取 %s 摘要成功（%d 字）", lang, page_title, len(content))
+    return [
+        RawSnippet(
+            character_name=character_name,
+            source_type=SOURCE_WIKI,
+            source_detail=f"{source_detail}({lang}·REST)",
+            title=page_title,
+            content=content,
+            url=full_url,
+            language=lang,
+            category=category,
+        )
+    ]
 
 
 def format_raw_snippets(snippets: list[RawSnippet], limit: int = 20) -> str:
@@ -107,27 +170,132 @@ def _ddg_search_urls(
     """
     用 DuckDuckGo 搜索单个 query，返回 [(url, title, snippet), ...]。
     只负责"找到 URL"，不依赖 body 摘要做正文（正文留给 web_fetcher 抓取）。
+
+    兼容两代包名：`duckduckgo_search` 已改名为 `ddgs`，优先用新包以避开弃用告警。
     """
-    try:
-        from duckduckgo_search import DDGS
-    except ImportError:
-        logger.warning("未安装 duckduckgo_search，跳过网页搜索")
+    DDGS = _import_ddgs()
+    if DDGS is None:
+        logger.warning("未安装 duckduckgo_search / ddgs，跳过 DuckDuckGo 搜索")
         return []
 
+    proxy = _ddg_proxy()
     out: list[tuple[str, str, str]] = []
     try:
-        with DDGS() as ddgs:
+        with DDGS(proxy=proxy) as ddgs:
             for r in ddgs.text(query, max_results=max_results):
                 url = r.get("href") or r.get("url") or ""
                 if not url:
                     continue
                 title = (r.get("title") or "")[:200]
-                snippet = (r.get("body") or "")[:500]
+                snippet = (r.get("body") or "")[:1200]
                 out.append((url, title, snippet))
     except Exception as e:
         # DuckDuckGo 偶尔限流，不应阻断整个流程
-        logger.warning("DuckDuckGo 搜索失败（可能被限流）: %s", e)
+        logger.warning("DuckDuckGo 搜索失败（可能被限流/网络不可达）: %s", e)
     return out
+
+
+def _import_ddgs():
+    """返回可用的 DDGS 类（优先新包 ddgs，回退旧包 duckduckgo_search）。"""
+    try:
+        from ddgs import DDGS  # type: ignore[import-not-found]
+
+        return DDGS
+    except ImportError:
+        pass
+    try:
+        from duckduckgo_search import DDGS
+
+        return DDGS
+    except ImportError:
+        return None
+
+
+# SOCKS 代理告警只打印一次，避免每个 query 都刷屏
+_socks_warned = False
+
+
+def _ddg_proxy() -> str | None:
+    """
+    解析 DuckDuckGo 要用的代理。
+
+    DDGS 只支持 HTTP(S) 代理；传 `socks5://` 会抛 ValueError 让搜索全面失败，
+    因此这里对 SOCKS 代理直接跳过（返回 None 并告警一次），交由 Bing RSS 兜底。
+    """
+    global _socks_warned
+    proxy = _normalize_proxy(settings.search.proxy)
+    if not proxy:
+        return None
+    if proxy.startswith(("socks4", "socks5", "socks")):
+        if not _socks_warned:
+            _socks_warned = True
+            logger.warning(
+                "DuckDuckGo 客户端不支持 SOCKS 代理（%s），本次跳过 DDG，改用 Bing RSS 兜底。"
+                "若想启用 DDG，请把 HTTPS_PROXY 改为 http:// 形式的代理地址。",
+                proxy,
+            )
+        return None
+    return proxy
+
+
+
+def _bing_rss_search_urls(
+    query: str, *, max_results: int
+) -> list[tuple[str, str, str]]:
+    """
+    Bing 新闻/网页 RSS 兜底搜索，返回与 _ddg_search_urls 相同的结构。
+
+    为什么需要它：DuckDuckGo 在国内网络常年不可达或限流，一旦它返回空，
+    整条「搜索 → 抓正文」的链路就全空（表现为「共 0 段资料」）。
+    Bing RSS 走普通 HTTPS，能走同一个代理，作为第二检索源显著提高命中率。
+    """
+    from urllib.parse import quote_plus
+    from xml.etree import ElementTree
+
+    url = f"https://www.bing.com/search?q={quote_plus(query)}&format=rss&count={max_results}"
+    try:
+        with httpx.Client(**http_client_config(timeout=15.0)) as client:
+            resp = client.get(url)
+        if resp.status_code != 200:
+            logger.debug("Bing RSS 返回 %d", resp.status_code)
+            return []
+        root = ElementTree.fromstring(resp.content)
+    except Exception as e:  # noqa: BLE001
+        logger.debug("Bing RSS 搜索失败: %s", e)
+        return []
+
+    out: list[tuple[str, str, str]] = []
+    for item in root.iter("item"):
+        link = (item.findtext("link") or "").strip()
+        title = (item.findtext("title") or "").strip()[:200]
+        desc = (item.findtext("description") or "").strip()[:1200]
+        if link.startswith(("http://", "https://")):
+            out.append((link, title, desc))
+        if len(out) >= max_results:
+            break
+    if out:
+        logger.info("Bing RSS 命中 %d 条（DuckDuckGo 不可用时的兜底源）", len(out))
+    return out
+
+
+def _web_search_urls(query: str, *, max_results: int) -> list[tuple[str, str, str]]:
+    """统一网页检索入口：DuckDuckGo 优先，空结果时用 Bing RSS 兜底。"""
+    results = _ddg_search_urls(query, max_results=max_results)
+    if results:
+        return results
+    return _bing_rss_search_urls(query, max_results=max_results)
+
+
+def web_search_health() -> tuple[bool, str]:
+    """探测网页检索是否可用（供 data_collector.health_check 汇总）。"""
+    try:
+        rows = _web_search_urls("维基百科", max_results=2)
+    except Exception as e:  # noqa: BLE001
+        return False, f"网页检索异常: {type(e).__name__}: {e}"
+    if rows:
+        return True, f"网页检索可用（返回 {len(rows)} 条）"
+    return False, "DuckDuckGo 与 Bing 均无结果（网络不可达或均被限流）"
+
 
 
 # ==================== 多语言维基百科 ====================
@@ -146,6 +314,8 @@ def search_wikipedia(
     """
     langs = languages or settings.search.wiki_languages
     snippets: list[RawSnippet] = []
+    # 记录 wikipediaapi 彻底不可用的语言（连接/超时），这些语言改走 REST 兜底
+    failed_langs: list[str] = []
 
     def _make_wiki(lang: str) -> wikipediaapi.Wikipedia:
         return wikipediaapi.Wikipedia(
@@ -167,6 +337,7 @@ def search_wikipedia(
         # 中文维基不可达时，仍尝试用原名逐语言抓取，避免丢失资料
         logger.warning("中文维基访问失败，将尝试用原名逐语言抓取: %s", e)
         titles = {}
+        failed_langs.append("zh")
 
     # 2. 逐语言抓取
     for lang in langs:
@@ -195,8 +366,56 @@ def search_wikipedia(
             logger.info("维基[%s]获取 %s 词条成功（%d 字）", lang, page.title, len(full_text))
         except Exception as e:
             logger.warning("维基[%s]获取 %s 失败: %s", lang, title, e)
+            failed_langs.append(lang)
+
+    # 3. REST 兜底：wikipediaapi（action=query）不可达时，改用 /api/rest_v1/ 摘要接口。
+    #    有些网络环境只放行后者，多一条路径就多一次拿到资料的机会。
+    got_langs = {s.language for s in snippets}
+    for lang in dict.fromkeys(failed_langs):
+        if lang in got_langs:
+            continue
+        fallback = _wiki_rest_summary(
+            lang,
+            titles.get(lang, character_name),
+            category=category,
+            source_detail=source_detail_prefix,
+            character_name=character_name,
+        )
+        snippets.extend(fallback)
+
+    if snippets:
+        logger.info("维基采集成功：%d 条（%s）", len(snippets), "、".join(sorted({s.language for s in snippets})))
+    else:
+        logger.warning(
+            "维基百科未取到任何词条（已尝试语言：%s）。%s",
+            "、".join(langs), proxy_hint(),
+        )
 
     return snippets
+
+
+def wikipedia_health() -> tuple[bool, str]:
+    """探测维基百科是否可用（wikipediaapi 与 REST 两条路径任一通即算可用）。"""
+    try:
+        page = wikipediaapi.Wikipedia(
+            language="zh",
+            user_agent=_WIKI_USER_AGENT,
+            extract_format=wikipediaapi.ExtractFormat.WIKI,
+            **_wiki_kwargs(),
+        ).page("马克思")
+        if page.exists() and len(page.summary) > 50:
+            return True, f"wikipediaapi 可用（zh 词条 {page.title}）"
+    except Exception as e:  # noqa: BLE001
+        logger.debug("wikipediaapi 探测失败: %s", e)
+
+    if _wiki_rest_summary(
+        "zh", "马克思", category=CATEGORY_WIKI,
+        source_detail="Wikipedia·健康检查", character_name="马克思",
+    ):
+        return True, "wikipediaapi 不可用，但 REST 摘要接口可用"
+
+    return False, f"维基百科不可达（wikipediaapi 与 REST 均失败）。{proxy_hint()}"
+
 
 
 # ==================== Step 1：姓名识别搜索 ====================
@@ -212,29 +431,23 @@ def search_person_candidates(
     snippets: list[RawSnippet] = []
     if settings.search.ddg_max_results > 0:
         # 这里只需要搜索摘要片段给 LLM 判断身份，不抓正文
-        try:
-            from duckduckgo_search import DDGS
-            with DDGS() as ddgs:
-                for q in [
-                    f"{input_name} 是谁 生平",
-                    f"{input_name} biography",
-                ]:
-                    for r in ddgs.text(q, max_results=max_results):
-                        url = r.get("href") or r.get("url") or ""
-                        snippets.append(
-                            RawSnippet(
-                                character_name=input_name,
-                                source_type=SOURCE_WEB,
-                                source_detail="DuckDuckGo·识别",
-                                title=(r.get("title") or "")[:200],
-                                content=(r.get("body") or "")[:1000],
-                                url=url,
-                                language="zh",
-                                category="",
-                            )
-                        )
-        except Exception as e:
-            logger.warning("识别阶段网页搜索失败: %s", e)
+        for q in [
+            f"{input_name} 是谁 生平",
+            f"{input_name} biography",
+        ]:
+            for url, title, snippet in _web_search_urls(q, max_results=max_results):
+                snippets.append(
+                    RawSnippet(
+                        character_name=input_name,
+                        source_type=SOURCE_WEB,
+                        source_detail="网页检索·识别",
+                        title=title,
+                        content=snippet[:1000],
+                        url=url,
+                        language="zh",
+                        category="",
+                    )
+                )
 
     snippets.extend(search_wikipedia(input_name, languages=["zh", "en"]))
     return dedupe_snippets(snippets)
@@ -272,7 +485,7 @@ def search_person_works(
     seen_urls: set[str] = set()
 
     for q in work_queries:
-        for url, title, snippet in _ddg_search_urls(q, max_results=max_results):
+        for url, title, snippet in _web_search_urls(q, max_results=max_results):
             if url in seen_urls:
                 continue
             seen_urls.add(url)
@@ -284,7 +497,7 @@ def search_person_works(
                     snippets.append(RawSnippet(
                         character_name=identity.name,
                         source_type=SOURCE_WEB,
-                        source_detail="DuckDuckGo·著作",
+                        source_detail="网页检索·著作",
                         title=page.title or title,
                         content=page.text,
                         url=url,
@@ -297,7 +510,7 @@ def search_person_works(
             snippets.append(RawSnippet(
                 character_name=identity.name,
                 source_type=SOURCE_WEB,
-                source_detail="DuckDuckGo·著作（摘要）",
+                source_detail="网页检索·著作（搜索摘要）",
                 title=title,
                 content=snippet,
                 url=url,
@@ -342,7 +555,7 @@ def search_person_biographies(
     seen_urls: set[str] = set()
 
     for q in bio_queries:
-        for url, title, snippet in _ddg_search_urls(q, max_results=max_results):
+        for url, title, snippet in _web_search_urls(q, max_results=max_results):
             if url in seen_urls:
                 continue
             seen_urls.add(url)
@@ -353,7 +566,7 @@ def search_person_biographies(
                     snippets.append(RawSnippet(
                         character_name=identity.name,
                         source_type=SOURCE_WEB,
-                        source_detail="DuckDuckGo·传记",
+                        source_detail="网页检索·传记",
                         title=page.title or title,
                         content=page.text,
                         url=url,
@@ -365,7 +578,7 @@ def search_person_biographies(
             snippets.append(RawSnippet(
                 character_name=identity.name,
                 source_type=SOURCE_WEB,
-                source_detail="DuckDuckGo·传记（摘要）",
+                source_detail="网页检索·传记（搜索摘要）",
                 title=title,
                 content=snippet,
                 url=url,
@@ -400,7 +613,7 @@ def search_person_history(
     seen_urls: set[str] = set()
 
     for q in history_queries:
-        for url, title, snippet in _ddg_search_urls(q, max_results=max_results):
+        for url, title, snippet in _web_search_urls(q, max_results=max_results):
             if url in seen_urls:
                 continue
             seen_urls.add(url)
@@ -411,7 +624,7 @@ def search_person_history(
                     snippets.append(RawSnippet(
                         character_name=identity.name,
                         source_type=SOURCE_WEB,
-                        source_detail="DuckDuckGo·史料",
+                        source_detail="网页检索·史料",
                         title=page.title or title,
                         content=page.text,
                         url=url,
@@ -423,7 +636,7 @@ def search_person_history(
             snippets.append(RawSnippet(
                 character_name=identity.name,
                 source_type=SOURCE_WEB,
-                source_detail="DuckDuckGo·史料（摘要）",
+                source_detail="网页检索·史料（搜索摘要）",
                 title=title,
                 content=snippet,
                 url=url,

@@ -12,8 +12,8 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import time
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Optional
 
 import httpx
@@ -29,16 +29,19 @@ _DEFAULT_UA = (
     "Chrome/120.0.0.0 Safari/537.36"
 )
 
-# 单页抓取超时（秒）：包含连接+读取，避免 yt-dlp 之外的环节长时间卡住
-_FETCH_TIMEOUT = 20.0
 # 单页正文最大字符数：防止某些站点把整本小说塞进来撑爆 token
 _MAX_TEXT_CHARS = 20000
 # 正文最短字符数：太短的可能是 404/导航页，直接丢弃
 _MIN_TEXT_CHARS = 200
+# 传输类错误退避基数（秒），仅用于重试之间的短暂等待
+_RETRY_BACKOFF = 0.6
 
 # 进程级 URL 缓存（最近 N 条命中即返回），用于同一人物构建期间重复 URL
 _URL_CACHE_MAX = 256
 _url_cache: dict[str, str] = {}
+
+# 只对「网络传输类」错误重试；HTTP 4xx/5xx 属于服务端明确答复，重试无意义
+_RETRYABLE_ERRORS = (httpx.TimeoutException, httpx.ConnectError, httpx.NetworkError)
 
 
 @dataclass
@@ -48,6 +51,62 @@ class FetchedPage:
     title: str
     text: str
     status: int = 200
+
+
+def _normalize_proxy(proxy: str | None) -> str | None:
+    """
+    规范化代理地址：允许只写 `127.0.0.1:7890`（补全 http://）。
+    httpx 要求带 scheme，否则每次请求都会抛「Invalid URL」，且报错信息很难定位。
+    """
+    proxy = (proxy or "").strip()
+    if not proxy:
+        return None
+    if "://" not in proxy:
+        proxy = f"http://{proxy}"
+    return proxy
+
+
+def http_client_config(*, timeout: float | None = None) -> dict:
+    """
+    统一的 httpx 客户端参数（web_fetcher / search_engine 共用），版本无关。
+
+    重要：httpx ≥ 0.28 已移除 `proxies=` 参数，只能用 `proxy=`（单个地址）。
+    旧代码写 `httpx.Client(proxies=...)` 会抛
+    `TypeError: Client.__init__() got an unexpected keyword argument 'proxies'`，
+    该异常不是 httpx.HTTPError、不会被捕获，导致整条采集链路静默失败
+    （表现为「共 0 段资料」）。
+    """
+    cfg = settings.search
+    config: dict = {
+        "timeout": cfg.fetch_timeout if timeout is None else timeout,
+        "follow_redirects": True,
+        # 让已导出的 HTTP(S)_PROXY 也能生效（显式 proxy= 时 httpx 会自动忽略 trust_env）
+        "trust_env": True,
+        "headers": {
+            "User-Agent": _DEFAULT_UA,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        },
+    }
+    proxy = _normalize_proxy(cfg.proxy)
+    if proxy:
+        config["proxy"] = proxy
+    return config
+
+
+def proxy_hint() -> str:
+    """代理相关的一句诊断提示，用于失败日志。"""
+    proxy = _normalize_proxy(settings.search.proxy)
+    if proxy:
+        return (
+            f"当前代理：{proxy}（若该代理未启动，所有海外站点都会失败；"
+            "请在 .env 中把 HTTPS_PROXY 改成实际可用的地址，或清空以直连）"
+        )
+    return (
+        "当前未配置代理（直连）。若本机无法直连维基/DuckDuckGo，"
+        "请在 .env 中设置 HTTPS_PROXY=http://127.0.0.1:7890（端口按你的代理软件填）"
+    )
+
 
 
 def _cache_key(url: str) -> str:
@@ -124,6 +183,7 @@ def fetch_url(url: str, *, max_chars: int = _MAX_TEXT_CHARS) -> Optional[Fetched
     """
     抓取单个 URL 的正文。失败返回 None，不抛异常（由调用方决定是否记日志）。
 
+    传输类错误（超时/连接失败）按 settings.search.fetch_retries 短暂重试；
     会在 CACHE_DIR 下记录抓取过的原始页面副本，便于离线复现。
     """
     if not url or not url.startswith(("http://", "https://")):
@@ -134,25 +194,33 @@ def fetch_url(url: str, *, max_chars: int = _MAX_TEXT_CHARS) -> Optional[Fetched
     if cached is not None:
         return FetchedPage(url=url, title="", text=cached)
 
-    # 2. 配置代理
-    proxy = settings.search.proxy or None
-    proxies = {"http://": proxy, "https://": proxy} if proxy else None
-    headers = {
-        "User-Agent": _DEFAULT_UA,
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-    }
+    tries = max(1, int(settings.search.fetch_retries) + 1)
+    resp: httpx.Response | None = None
+    last_error: Exception | None = None
 
-    try:
-        with httpx.Client(
-            timeout=_FETCH_TIMEOUT,
-            follow_redirects=True,
-            proxies=proxies,
-            headers=headers,
-        ) as client:
-            resp = client.get(url)
-    except httpx.HTTPError as e:
-        logger.debug("抓取失败 %s: %s", url, e)
+    for attempt in range(tries):
+        try:
+            with httpx.Client(**http_client_config()) as client:
+                resp = client.get(url)
+            break
+        except _RETRYABLE_ERRORS as e:
+            last_error = e
+            if attempt + 1 < tries:
+                time.sleep(_RETRY_BACKOFF * (attempt + 1))
+                continue
+            logger.debug("抓取失败 %s: %s（%s）", url, e, proxy_hint())
+            return None
+        except Exception as e:  # noqa: BLE001
+            # 非传输类错误（如参数不兼容、无效代理地址）必须显式记警告：
+            # 旧版把这类错误漏出 except httpx.HTTPError 之外，导致整条链路静默失败。
+            logger.warning("抓取 %s 出现非预期错误: %s: %s", url, type(e).__name__, e)
+            if attempt + 1 < tries:
+                time.sleep(_RETRY_BACKOFF * (attempt + 1))
+                continue
+            return None
+
+    if resp is None:
+        logger.debug("抓取 %s 失败: %s", url, last_error)
         return None
 
     if resp.status_code != 200:

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 import sys
+import threading
 from pathlib import Path
 
 import gradio as gr
@@ -442,6 +443,33 @@ def build_ui() -> gr.Blocks:
     return demo
 
 
+def _warn_if_sources_unreachable() -> None:
+    """
+    后台探测数据源可用性，不可用时打印明确警告。
+
+    背景：采集链路全线失败时前端只显示「共 0 段资料」，无法区分
+    「代理没开」和「代码问题」。这里提前把原因写在控制台。
+    """
+    def _probe() -> None:
+        try:
+            from core.data_collector import format_health_report, health_check
+
+            results = health_check()
+            failed = [name for name, ok, _ in results if not ok]
+            if failed:
+                logger.warning(
+                    "数据源自检发现 %d 项不可用：%s\n%s",
+                    len(failed), "、".join(failed), format_health_report(results),
+                )
+            else:
+                logger.info("数据源自检通过：%s",
+                            "、".join(f"{n}✅" for n, _, _ in results))
+        except Exception as e:  # noqa: BLE001
+            logger.debug("数据源自检失败: %s", e)
+
+    threading.Thread(target=_probe, name="source-health-check", daemon=True).start()
+
+
 if __name__ == "__main__":
     ensure_dirs()
     ensure_db()
@@ -454,6 +482,7 @@ if __name__ == "__main__":
             "UI 可启动，但档案构建和对话需要配置后才能使用。\n" +
             "=" * 60
         )
+    _warn_if_sources_unreachable()
     demo = build_ui()
     demo.launch(
         server_name="127.0.0.1",

@@ -248,6 +248,91 @@ def summarize_sources(docs: list[Document]) -> dict[str, int]:
     return counts
 
 
+# ==================== 数据源健康检查 ====================
+
+def health_check() -> list[tuple[str, bool, str]]:
+    """
+    逐个探测数据源可用性，返回 [(名称, 是否可用, 说明), ...]。
+
+    用途：`python launcher.py check` 或构建档案前的自检。
+    背景：采集链路一旦全线失败，前端只会显示「共 0 段资料」，
+    看不出到底是代理没开、站点被墙，还是代码不兼容，因此需要显式探测。
+    """
+    from core.search_engine import web_search_health, wikipedia_health
+    from core.web_fetcher import fetch_url
+
+    results: list[tuple[str, bool, str]] = []
+
+    # 1. 预置著作库（离线，永远可用）
+    preset_ok = WORKS_DIR.exists()
+    results.append((
+        "预置著作库",
+        preset_ok,
+        f"目录 {WORKS_DIR}" if preset_ok else f"目录不存在：{WORKS_DIR}",
+    ))
+
+    # 2. 网页正文抓取（顺带覆盖代理与 TLS 是否可用）
+    #    注意：探针不能选 bing.com 这类「首页几乎全是导航/表单、没有正文段落」的页面，
+    #    它们会被正文长度过滤规则判为无效页，从而误报失败。这里选正文稳定的页面。
+    probe_urls = (
+        "https://example.com",
+        "https://www.iana.org/help/example-domains",
+    )
+    last_reason = ""
+    fetch_ok = False
+    fetch_detail = ""
+    for url in probe_urls:
+        try:
+            page = fetch_url(url, max_chars=1000)
+        except Exception as e:  # noqa: BLE001
+            last_reason = f"抛出异常：{type(e).__name__}: {e}"
+            continue
+        if page is not None and len(page.text) >= 200:
+            fetch_ok = True
+            fetch_detail = f"成功抓取 {len(page.text)} 字（{url}）"
+            break
+        last_reason = f"{url} 抓取失败或正文过短"
+
+    if fetch_ok:
+        results.append(("网页抓取", True, fetch_detail))
+    else:
+        from core.web_fetcher import proxy_hint
+
+        results.append(("网页抓取", False, f"{last_reason}。{proxy_hint()}"))
+
+    # 3. 网页检索（DuckDuckGo → Bing RSS 兜底）
+    ok, detail = web_search_health()
+    results.append(("网页检索", ok, detail))
+
+    # 4. 维基百科（wikipediaapi → REST 兜底）
+    ok, detail = wikipedia_health()
+    results.append(("维基百科", ok, detail))
+
+    return results
+
+
+def format_health_report(results: list[tuple[str, bool, str]]) -> str:
+    """把健康检查结果格式化成可读报告。"""
+    lines = ["数据源自检："]
+    for name, ok, detail in results:
+        lines.append(f"  {'✅' if ok else '❌'} {name}：{detail}")
+    failed = [name for name, ok, _ in results if not ok]
+    lines.append("")
+    if failed:
+        lines.append(
+            f"⚠️ 有 {len(failed)} 项数据源不可用：{'、'.join(failed)}。"
+            "档案仍可构建，但会退化为「仅用 LLM 内置知识」，质量较低。"
+        )
+        lines.append(
+            "   最常见原因：未配置代理或代理未启动。"
+            "请在 .env 中设置 HTTPS_PROXY=http://127.0.0.1:7890（端口按你的代理软件填），"
+            "或确认代理软件已运行。"
+        )
+    else:
+        lines.append("✅ 所有数据源均可用。")
+    return "\n".join(lines)
+
+
 def _material_category(doc: Document) -> str:
     """兼容旧数据：无 category 字段时，从来源详情推断资料类别。"""
     detail = doc.source_detail or ""
